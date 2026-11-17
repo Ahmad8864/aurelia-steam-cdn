@@ -1,8 +1,8 @@
 // Modified by Aurelia; see README.
 use depot::AppDepots;
+use futures::TryStreamExt;
 use inner::InnerClient;
 use manifest::DepotManifest;
-use futures::TryStreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use steam_vent::{Connection, ConnectionTrait};
@@ -174,7 +174,11 @@ impl CDNClient {
         }
 
         let target_dir = paths::prepare_root(target_dir.as_ref())?;
-        let aborted = || abort_signal.as_ref().is_some_and(|s| s.load(Ordering::Relaxed));
+        let aborted = || {
+            abort_signal
+                .as_ref()
+                .is_some_and(|s| s.load(Ordering::Relaxed))
+        };
 
         // Folders and links first, in order.
         let mut regular = Vec::new();
@@ -214,8 +218,7 @@ impl CDNClient {
                             )));
                         }
                         let bytes = file.download_to_memory(key_arr).await?;
-                        String::from_utf8(bytes)
-                            .map_err(|e| Error::Unexpected(e.to_string()))?
+                        String::from_utf8(bytes).map_err(|e| Error::Unexpected(e.to_string()))?
                     };
                     let target = raw_target
                         .trim_matches(|c: char| c.is_whitespace() || c == '\0')
@@ -266,7 +269,10 @@ impl CDNClient {
                 let on_progress = on_progress.clone();
                 let root = target_dir.clone();
                 async move {
-                    if abort_signal.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
+                    if abort_signal
+                        .as_ref()
+                        .is_some_and(|s| s.load(Ordering::Relaxed))
+                    {
                         return Ok(());
                     }
                     paths::unlink_symlink(&full_path)?;
@@ -311,8 +317,13 @@ impl CDNClient {
             .get_manifest_bytes(depot_id, manifest_id, request_code, MANIFEST_VERSION)
             .await?;
 
-        let mut manifest =
-            DepotManifest::deserialize(self.inner.clone(), app_id, depot_id, manifest_id, &bytes[..])?;
+        let mut manifest = DepotManifest::deserialize(
+            self.inner.clone(),
+            app_id,
+            depot_id,
+            manifest_id,
+            &bytes[..],
+        )?;
         if manifest.filenames_encrypted() {
             if let Some(key) = depot_key {
                 manifest.decrypt_filenames(key)?;

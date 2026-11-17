@@ -3,9 +3,9 @@ use std::io::Cursor;
 use zip::ZipArchive;
 
 use crate::{
+    Error,
     crypto::aes256::{self, IV_LENGTH},
     utils::lzma,
-    Error,
 };
 
 /// Decrypt, decompress; cap at `max_len`.

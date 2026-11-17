@@ -42,32 +42,42 @@ pub struct CDNServer {
     pub auth_token: Option<String>,
 }
 
+/// Largest accepted server-list body.
+pub const MAX_SERVER_LIST_LEN: usize = 4 << 20;
+
 pub async fn get_servers_for_steam_pipe(cell_id: u32) -> Result<Vec<CDNServer>, Error> {
-    Ok(prefer_https(
-        Client::new()
-            .get("https://api.steampowered.com/IContentServerDirectoryService/GetServersForSteamPipe/v1/")
-            .query(&[("cell_id", cell_id)])
-            .send().await?
-            .json::<ContentServerDirectory>().await?
-            .response
-            .servers
-            .into_iter()
-            .map(|server| {
-                let https = supports_https(&server.https_support);
-                CDNServer {
-                    r#type: server.r#type,
-                    https,
-                    host: server.host,
-                    vhost: server.vhost,
-                    port: if https { 443 } else { 80 },
-                    cell_id: server.cell_id.unwrap_or(0),
-                    load: server.load,
-                    weighted_load: server.weighted_load,
-                    auth_token: None,
-                }
-            })
-            .collect::<Vec<CDNServer>>(),
-    ))
+    let response = Client::new()
+        .get("https://api.steampowered.com/IContentServerDirectoryService/GetServersForSteamPipe/v1/")
+        .query(&[("cell_id", cell_id)])
+        .send()
+        .await?;
+    let body = crate::cdn::inner::read_paced(response, None, MAX_SERVER_LIST_LEN).await?;
+    Ok(prefer_https(parse_server_list(&body)?))
+}
+
+/// Parse GetServersForSteamPipe's JSON.
+fn parse_server_list(body: &[u8]) -> Result<Vec<CDNServer>, Error> {
+    let directory: ContentServerDirectory = serde_json::from_slice(body)
+        .map_err(|e| Error::Request(format!("bad server list: {e}")))?;
+    Ok(directory
+        .response
+        .servers
+        .into_iter()
+        .map(|server| {
+            let https = supports_https(&server.https_support);
+            CDNServer {
+                r#type: server.r#type,
+                https,
+                host: server.host,
+                vhost: server.vhost,
+                port: if https { 443 } else { 80 },
+                cell_id: server.cell_id.unwrap_or(0),
+                load: server.load,
+                weighted_load: server.weighted_load,
+                auth_token: None,
+            }
+        })
+        .collect())
 }
 
 /// Whether `https_support` allows TLS.
@@ -90,6 +100,15 @@ pub fn prefer_https(servers: Vec<CDNServer>) -> Vec<CDNServer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_a_server_list() {
+        let raw = br#"{"response":{"servers":[{"type":"CDN","source_id":1,"cell_id":5,"load":1,"weighted_load":2,"num_entries_in_client_list":1,"host":"a.example","vhost":"a.example","https_support":"mandatory","priority_class":0}]}}"#;
+        let servers = parse_server_list(raw).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].https);
+        assert!(parse_server_list(b"not json").is_err());
+    }
 
     fn server(host: &str, https: bool) -> CDNServer {
         CDNServer {
@@ -116,7 +135,10 @@ mod tests {
     #[test]
     fn https_servers_win_when_present() {
         let kept = prefer_https(vec![server("a", false), server("b", true)]);
-        assert_eq!(kept.iter().map(|s| s.host.as_str()).collect::<Vec<_>>(), ["b"]);
+        assert_eq!(
+            kept.iter().map(|s| s.host.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
     }
 
     #[test]

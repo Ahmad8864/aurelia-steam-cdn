@@ -1,7 +1,6 @@
 use base64::{
-    alphabet,
+    DecodeError, Engine, alphabet,
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
-    DecodeError, Engine,
 };
 
 pub fn base64_decode<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, DecodeError> {
