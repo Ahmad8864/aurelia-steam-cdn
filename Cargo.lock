@@ -100,6 +100,7 @@ dependencies = [
  "reqwest",
  "ruzstd",
  "serde",
+ "serde_json",
  "sha1",
  "steam-vent-proto",
  "thiserror 2.0.21",

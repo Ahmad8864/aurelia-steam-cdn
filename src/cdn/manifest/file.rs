@@ -21,6 +21,19 @@ pub const FLAG_DIRECTORY: u32 = 64;
 /// Steam EDepotFileFlag::Symlink bit.
 pub const FLAG_SYMLINK: u32 = 512;
 
+/// Largest file `download_to_memory` accepts.
+pub const MAX_IN_MEMORY_LEN: u64 = 64 << 20;
+
+/// Refuse manifest sizes too big for memory.
+fn check_in_memory_len(size: u64) -> Result<(), Error> {
+    if size > MAX_IN_MEMORY_LEN {
+        return Err(Error::Unexpected(format!(
+            "file of {size} bytes is too large to read into memory"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct ChunkData {
     pub(super) sha: Vec<u8>,
@@ -124,7 +137,10 @@ impl ManifestFile {
     /// Fetch this file's full content into memory. Symlink entries store
     /// their link target as chunk data, so they need content without a
     /// destination file on disk.
+    ///
+    /// Refuses files over [`MAX_IN_MEMORY_LEN`].
     pub async fn download_to_memory(&self, depot_key: [u8; 32]) -> Result<Vec<u8>, Error> {
+        check_in_memory_len(self.size)?;
         let mut buffer = vec![0u8; self.size as usize];
         for chunk in self
             .chunks()
@@ -368,5 +384,18 @@ impl ChunkJob {
             tracing::warn!("Corruption detected in chunk {}", self.id);
         }
         Ok(matches)
+    }
+}
+
+#[cfg(test)]
+mod in_memory_tests {
+    use super::*;
+
+    #[test]
+    fn in_memory_len_is_capped() {
+        assert!(check_in_memory_len(0).is_ok());
+        assert!(check_in_memory_len(MAX_IN_MEMORY_LEN).is_ok());
+        assert!(check_in_memory_len(MAX_IN_MEMORY_LEN + 1).is_err());
+        assert!(check_in_memory_len(u64::MAX).is_err());
     }
 }
