@@ -1,16 +1,16 @@
 // Modified by Aurelia; see README.
 use reqwest::{Client, Response};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use steam_vent::{Connection, ConnectionTrait};
 use steam_vent_proto::steammessages_clientserver_appinfo::{
-    cmsg_client_picsproduct_info_request::AppInfo, CMsgClientPICSAccessTokenRequest,
-    CMsgClientPICSAccessTokenResponse, CMsgClientPICSProductInfoRequest,
-    CMsgClientPICSProductInfoResponse,
+    CMsgClientPICSAccessTokenRequest, CMsgClientPICSAccessTokenResponse,
+    CMsgClientPICSProductInfoRequest, CMsgClientPICSProductInfoResponse,
+    cmsg_client_picsproduct_info_request::AppInfo,
 };
 
-use crate::{web_api::content_service::CDNServer, Error};
+use crate::{Error, web_api::content_service::CDNServer};
 
 use super::depot_chunk;
 use super::throttle::RateLimiter;
@@ -72,7 +72,9 @@ pub(crate) fn check_chunk(
     }
     // Empty hash: nothing to compare.
     if !expected_sha.is_empty() && sha1::Sha1::digest(&data).as_slice() != expected_sha {
-        return Err(Error::Decompress(format!("chunk {chunk_id}: SHA-1 mismatch")));
+        return Err(Error::Decompress(format!(
+            "chunk {chunk_id}: SHA-1 mismatch"
+        )));
     }
     Ok(data)
 }
@@ -167,7 +169,11 @@ impl InnerClient {
 
     /// Next healthy server, round-robin.
     fn pick_server(&self) -> Result<usize, Error> {
-        let strikes: Vec<u32> = self.strikes.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        let strikes: Vec<u32> = self
+            .strikes
+            .iter()
+            .map(|s| s.load(Ordering::Relaxed))
+            .collect();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         pick_index(&strikes, start).ok_or(Error::Network("no available cdn servers".to_string()))
     }
@@ -178,7 +184,8 @@ impl InnerClient {
         };
         if ok {
             // Recovered hosts earn their way back.
-            let _ = strikes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| s.checked_sub(1));
+            let _ =
+                strikes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| s.checked_sub(1));
         } else {
             strikes.fetch_add(1, Ordering::Relaxed);
         }
@@ -427,7 +434,9 @@ mod tests {
     #[test]
     fn only_transfer_errors_retry() {
         assert!(retryable(&Error::Request("reset".into())));
-        assert!(retryable(&Error::HttpStatus(reqwest::StatusCode::BAD_GATEWAY)));
+        assert!(retryable(&Error::HttpStatus(
+            reqwest::StatusCode::BAD_GATEWAY
+        )));
         assert!(retryable(&Error::Decompress("bad zip".into())));
         // Disk errors never retry.
         let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
@@ -508,7 +517,11 @@ mod pacing_tests {
             .await
             .unwrap();
         assert_eq!(body.len(), 40_000);
-        assert!(start.elapsed() >= Duration::from_millis(350), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() >= Duration::from_millis(350),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]

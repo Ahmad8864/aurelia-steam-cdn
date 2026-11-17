@@ -100,7 +100,11 @@ impl DepotManifest {
     ) -> Result<Self, ManifestError> {
         let is_zip = data.len() > 2 && data[0] == 0x50 && data[1] == 0x4B;
 
-        let buffer = if is_zip { unzip_manifest(data, MAX_MANIFEST_LEN)? } else { None };
+        let buffer = if is_zip {
+            unzip_manifest(data, MAX_MANIFEST_LEN)?
+        } else {
+            None
+        };
         let raw_data = buffer.as_deref().unwrap_or(data);
 
         let mut bytes = Bytes::from(raw_data.to_vec());
@@ -138,17 +142,28 @@ impl DepotManifest {
                 0
             };
 
-            payload = Some(ContentManifestPayload::parse_from_bytes(&raw_data[offset..])?);
+            payload = Some(ContentManifestPayload::parse_from_bytes(
+                &raw_data[offset..],
+            )?);
         }
 
         let payload = payload.expect("Payload should be present at this point");
 
         let final_depot_id = metadata.as_ref().map(|m| m.depot_id()).unwrap_or(depot_id);
-        let final_manifest_gid = metadata.as_ref().map(|m| m.gid_manifest()).unwrap_or(manifest_gid);
+        let final_manifest_gid = metadata
+            .as_ref()
+            .map(|m| m.gid_manifest())
+            .unwrap_or(manifest_gid);
         let final_creation_time = metadata.as_ref().map(|m| m.creation_time()).unwrap_or(0);
-        let final_filenames_encrypted = metadata.as_ref().map(|m| m.filenames_encrypted()).unwrap_or(false);
+        let final_filenames_encrypted = metadata
+            .as_ref()
+            .map(|m| m.filenames_encrypted())
+            .unwrap_or(false);
         let final_original_size = metadata.as_ref().map(|m| m.cb_disk_original()).unwrap_or(0);
-        let final_compressed_size = metadata.as_ref().map(|m| m.cb_disk_compressed()).unwrap_or(0);
+        let final_compressed_size = metadata
+            .as_ref()
+            .map(|m| m.cb_disk_compressed())
+            .unwrap_or(0);
 
         Ok(Self {
             app_id,
@@ -220,7 +235,8 @@ mod unzip_tests {
     fn zipped(len: usize) -> Vec<u8> {
         let mut out = Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut out);
-        zip.start_file("z", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.start_file("z", zip::write::SimpleFileOptions::default())
+            .unwrap();
         zip.write_all(&vec![0u8; len]).unwrap();
         zip.finish().unwrap();
         out.into_inner()
@@ -233,7 +249,10 @@ mod unzip_tests {
 
     #[test]
     fn manifest_over_limit_is_rejected() {
-        assert!(matches!(unzip_manifest(&zipped(65), 64), Err(ManifestError::Decompress(_))));
+        assert!(matches!(
+            unzip_manifest(&zipped(65), 64),
+            Err(ManifestError::Decompress(_))
+        ));
     }
 
     #[test]

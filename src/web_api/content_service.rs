@@ -116,7 +116,10 @@ mod tests {
     #[test]
     fn https_servers_win_when_present() {
         let kept = prefer_https(vec![server("a", false), server("b", true)]);
-        assert_eq!(kept.iter().map(|s| s.host.as_str()).collect::<Vec<_>>(), ["b"]);
+        assert_eq!(
+            kept.iter().map(|s| s.host.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
     }
 
     #[test]

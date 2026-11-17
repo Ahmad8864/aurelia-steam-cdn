@@ -61,7 +61,9 @@ pub fn decompress_vsz(data: &[u8], max_len: usize) -> Result<Vec<u8>, Error> {
         return Err(Error::Eof("VSZ chunk too small".to_string()));
     }
     if data[data.len() - 3..] != VSZ_FOOTER_MAGIC {
-        return Err(Error::Decompress("expecting zsv at end of stream".to_string()));
+        return Err(Error::Decompress(
+            "expecting zsv at end of stream".to_string(),
+        ));
     }
 
     // The Zstandard frame sits between the fixed header and footer. It is
@@ -158,7 +160,10 @@ mod tests {
 
     #[test]
     fn read_bounded_rejects_overflow() {
-        assert!(matches!(read_bounded(&[7u8; 17][..], 16), Err(Error::Decompress(_))));
+        assert!(matches!(
+            read_bounded(&[7u8; 17][..], 16),
+            Err(Error::Decompress(_))
+        ));
     }
 
     #[tokio::test]
@@ -176,7 +181,10 @@ mod tests {
         data.extend_from_slice(&0u32.to_le_bytes());
         data.extend_from_slice(&u32::MAX.to_le_bytes());
         data.extend_from_slice(&0x767Au16.to_le_bytes());
-        assert!(matches!(decompress(&data, 1024).await, Err(Error::Decompress(_))));
+        assert!(matches!(
+            decompress(&data, 1024).await,
+            Err(Error::Decompress(_))
+        ));
     }
 
     fn vz_declaring(size: u32) -> Vec<u8> {

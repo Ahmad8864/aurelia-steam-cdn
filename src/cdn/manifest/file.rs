@@ -1,16 +1,16 @@
 // Modified by Aurelia; see README.
-use futures::{stream::FuturesOrdered, StreamExt};
+use futures::{StreamExt, stream::FuturesOrdered};
 use itertools::Itertools;
 use sha1::Digest;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing;
 use std::{fmt::Write, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::Semaphore,
 };
+use tracing;
 
-use crate::{cdn::inner::InnerClient, Error};
+use crate::{Error, cdn::inner::InnerClient};
 
 /// Steam EDepotFileFlag::Executable bit.
 pub const FLAG_EXECUTABLE: u32 = 32;
@@ -126,7 +126,11 @@ impl ManifestFile {
     /// destination file on disk.
     pub async fn download_to_memory(&self, depot_key: [u8; 32]) -> Result<Vec<u8>, Error> {
         let mut buffer = vec![0u8; self.size as usize];
-        for chunk in self.chunks().iter().sorted_by(|a, b| a.offset.cmp(&b.offset)) {
+        for chunk in self
+            .chunks()
+            .iter()
+            .sorted_by(|a, b| a.offset.cmp(&b.offset))
+        {
             let data = self
                 .inner
                 .get_chunk(
@@ -244,9 +248,7 @@ impl ManifestFile {
                 return Ok(());
             }
         }
-        let metadata = tokio::fs::metadata(target_path)
-            .await
-            .map_err(Error::Io)?;
+        let metadata = tokio::fs::metadata(target_path).await.map_err(Error::Io)?;
         let mut permissions = metadata.permissions();
         if permissions.mode() & 0o111 != 0 {
             return Ok(());
@@ -304,7 +306,11 @@ impl ChunkJob {
         abort_signal: Option<Arc<AtomicBool>>,
         on_progress: Option<ProgressFn>,
     ) -> Result<(u64, Option<Vec<u8>>), Error> {
-        let aborted = || abort_signal.as_ref().is_some_and(|s| s.load(Ordering::Relaxed));
+        let aborted = || {
+            abort_signal
+                .as_ref()
+                .is_some_and(|s| s.load(Ordering::Relaxed))
+        };
         if aborted() {
             return Ok((self.offset, None));
         }

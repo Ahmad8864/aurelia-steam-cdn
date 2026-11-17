@@ -181,7 +181,10 @@ mod tests {
 
     #[test]
     fn plain_paths_are_kept() {
-        assert_eq!(relative_entry("bin/game").unwrap(), PathBuf::from("bin/game"));
+        assert_eq!(
+            relative_entry("bin/game").unwrap(),
+            PathBuf::from("bin/game")
+        );
         assert_eq!(relative_entry("./a/./b").unwrap(), PathBuf::from("a/b"));
     }
 

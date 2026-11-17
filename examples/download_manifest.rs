@@ -1,6 +1,6 @@
 // Modified by Aurelia; see README.
-use std::{error::Error, sync::Arc};
 use aurelia_steam_cdn::CDNClient;
+use std::{error::Error, sync::Arc};
 use steam_vent::{Connection, ServerList};
 use tokio::fs;
 
