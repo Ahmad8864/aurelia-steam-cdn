@@ -1,6 +1,6 @@
 [package]
 name = "aurelia-steam-cdn"
-version = "4.0.2"
+version = "4.1.0"
 edition = "2024"
 description = "Steam CDN client (Aurelia fork of steam-cdn, built on aurelia-steam-vent 0.8)"
 license = "GPL-3.0-or-later"
@@ -18,13 +18,13 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "que
 thiserror = "2.0"
 tracing = "0.1"
 zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"] } # Deflate only: Steam zips nothing else.
-itertools = "0.14"
+itertools = "0.15"
 crc32fast = "1.4"
 bytes = "1.9"
-base64 = "0.22"
+base64 = "0.23"
 protobuf = "3.7.2"
-aes = "0.8"
-cbc = "0.1"
-sha1 = "0.10"
+aes = "0.9"
+cbc = "0.2"
+sha1 = "0.11"
 lzma-rs = { version = "0.3", features = ["raw_decoder"] }
 ruzstd = "0.9.1" # Decodes Steam's VSZ chunk containers.

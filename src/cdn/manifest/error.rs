@@ -48,8 +48,8 @@ impl From<TryGetError> for ManifestError {
     }
 }
 
-impl From<block_padding::UnpadError> for ManifestError {
-    fn from(err: block_padding::UnpadError) -> Self {
+impl From<block_padding::Error> for ManifestError {
+    fn from(err: block_padding::Error) -> Self {
         Self::DecryptFilename(err.to_string())
     }
 }
