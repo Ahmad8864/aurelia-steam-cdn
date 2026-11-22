@@ -184,9 +184,9 @@ dependencies = [
 
 [[package]]
 name = "aurelia-steam-vent-proto"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "215d52d899afaf0b206fdc5aed2dfda7de2c61d46a2f6083ac5f1d61c4a37d20"
+checksum = "c92cc946115b28e257e16b205dbbe13534f081dc47ebdd51744f031dba9166d2"
 dependencies = [
  "aurelia-steam-vent-proto-common",
  "aurelia-steam-vent-proto-steam",
@@ -194,18 +194,18 @@ dependencies = [
 
 [[package]]
 name = "aurelia-steam-vent-proto-common"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85c5392640035360a7b236104ebb58a91933c079a4b050d82314bbed45d95d97"
+checksum = "0fad686e3b95a4c97a9cf0a74a530d64678485adb32dfefa058551a1373ce9cc"
 dependencies = [
  "protobuf",
 ]
 
 [[package]]
 name = "aurelia-steam-vent-proto-steam"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "692f1d3706ee867c826a71d8f449482b44d82248bdc7432414ae4cb133f30ff6"
+checksum = "09e3f34cbe0bb7d50d7ecf02ee4cc2698252038bb4ef8a4437ebcd747576a590"
 dependencies = [
  "aurelia-steam-vent-proto-common",
 ]

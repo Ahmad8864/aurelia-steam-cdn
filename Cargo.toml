@@ -10,7 +10,7 @@ repository = "https://github.com/Drackrath/aurelia-steam-cdn"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "fs", "macros"] }
 futures = "0.3"
 steam-vent = { package = "aurelia-steam-vent", version = "0.8.0" }
-steam-vent-proto = { package = "aurelia-steam-vent-proto", version = "0.6.0" }
+steam-vent-proto = { package = "aurelia-steam-vent-proto", version = "0.6.1" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 keyvalues-parser = "0.2"
