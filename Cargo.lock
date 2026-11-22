@@ -99,7 +99,6 @@ dependencies = [
  "itertools",
  "keyvalues-parser",
  "lzma-rs",
- "protobuf",
  "reqwest",
  "ruzstd",
  "serde",

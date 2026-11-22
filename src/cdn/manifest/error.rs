@@ -30,8 +30,8 @@ impl From<io::Error> for ManifestError {
     }
 }
 
-impl From<protobuf::Error> for ManifestError {
-    fn from(err: protobuf::Error) -> Self {
+impl From<steam_vent_proto::protobuf::Error> for ManifestError {
+    fn from(err: steam_vent_proto::protobuf::Error) -> Self {
         Self::Protobuf(err.to_string())
     }
 }
