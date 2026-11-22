@@ -13,6 +13,7 @@ use tracing;
 use crate::{Error, cdn::inner::InnerClient};
 
 /// Steam EDepotFileFlag::Executable bit.
+#[cfg(unix)]
 pub const FLAG_EXECUTABLE: u32 = 32;
 
 /// Steam EDepotFileFlag::Directory bit.

@@ -16,7 +16,6 @@ use zip::ZipArchive;
 use super::inner::InnerClient;
 use crate::{crypto::aes256, utils::base64::base64_decode};
 
-mod buf;
 pub mod error;
 pub mod file;
 
@@ -24,8 +23,6 @@ const PROTOBUF_PAYLOAD_MAGIC: u32 = 0x71F617D0;
 /// Largest unzipped manifest accepted.
 const MAX_MANIFEST_LEN: usize = 512 * 1024 * 1024;
 const PROTOBUF_METADATA_MAGIC: u32 = 0x1F4812BE;
-const PROTOBUF_SIGNATURE_MAGIC: u32 = 0x1B81B817;
-const PROTOBUF_ENDOFMANIFEST_MAGIC: u32 = 0x32C415AB;
 
 #[derive(Debug)]
 pub struct DepotManifest {
@@ -40,6 +37,10 @@ pub struct DepotManifest {
 }
 
 impl DepotManifest {
+    pub fn app_id(&self) -> u32 {
+        self.app_id
+    }
+
     pub fn depot_id(&self) -> u32 {
         self.depot_id
     }

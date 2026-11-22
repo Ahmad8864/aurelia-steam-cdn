@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::Error;
 
 /// Longest accepted symlink target.
+#[cfg(unix)]
 pub(crate) const MAX_LINK_TARGET: u64 = 4096;
 
 fn unsafe_path(what: &str, path: &str) -> Error {
@@ -35,6 +36,7 @@ pub(crate) fn relative_entry(path: &str) -> Result<PathBuf, Error> {
 }
 
 /// Whether a link target stays inside.
+#[cfg(unix)]
 pub(crate) fn link_stays_inside(link: &Path, target: &str) -> bool {
     let target = Path::new(target);
     if target.as_os_str().is_empty() || target.has_root() {
@@ -195,6 +197,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn link_targets_must_stay_inside() {
         let link = Path::new("lib/libfoo.so");
