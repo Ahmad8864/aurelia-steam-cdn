@@ -1,6 +1,6 @@
 [package]
 name = "aurelia-steam-cdn"
-version = "4.0.1"
+version = "4.0.2"
 edition = "2024"
 description = "Steam CDN client (Aurelia fork of steam-cdn, built on aurelia-steam-vent 0.8)"
 license = "GPL-3.0-or-later"
@@ -17,7 +17,7 @@ keyvalues-parser = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 thiserror = "2.0"
 tracing = "0.1"
-zip = "2.2.2"
+zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"] } # Deflate only: Steam zips nothing else.
 itertools = "0.14"
 crc32fast = "1.4"
 bytes = "1.9"
