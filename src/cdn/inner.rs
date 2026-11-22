@@ -39,16 +39,25 @@ pub(crate) struct InnerClient {
 }
 
 /// Index to use, skipping benched hosts.
+#[cfg(test)]
 pub(crate) fn pick_index(strikes: &[u32], start: usize) -> Option<usize> {
+    pick_index_excluding(strikes, start, &[])
+}
+
+/// Healthy index, never a `refused` one.
+pub(crate) fn pick_index_excluding(
+    strikes: &[u32],
+    start: usize,
+    refused: &[usize],
+) -> Option<usize> {
     let n = strikes.len();
-    if n == 0 {
-        return None;
-    }
+    let open = |i: &usize| !refused.contains(i);
     (0..n)
         .map(|i| (start + i) % n)
+        .filter(open)
         .find(|&i| strikes[i] < BENCH_STRIKES)
         // All benched: least-failing one.
-        .or_else(|| (0..n).min_by_key(|&i| strikes[i]))
+        .or_else(|| (0..n).filter(open).min_by_key(|&i| strikes[i]))
 }
 
 /// Delay before retry `attempt` (0-based).
@@ -121,6 +130,8 @@ pub(crate) fn retry_delay(err: &Error, attempt: u32, retry_after: Option<Duratio
 pub(crate) struct Failure {
     pub err: Error,
     pub retry_after: Option<Duration>,
+    /// Host index that answered.
+    pub host: Option<usize>,
 }
 
 impl From<Error> for Failure {
@@ -128,6 +139,7 @@ impl From<Error> for Failure {
         Self {
             err,
             retry_after: None,
+            host: None,
         }
     }
 }
@@ -155,6 +167,7 @@ pub(crate) async fn response_outcome(
         return Err(Failure {
             retry_after: retry_after(&response),
             err: Error::HttpStatus(status),
+            host: None,
         });
     }
     Ok(read_paced(response, limiter, max_len).await?)
@@ -162,8 +175,9 @@ pub(crate) async fn response_outcome(
 
 /// Run `fetch` up to `attempts` times.
 ///
-/// Busy or broken replies back off; a 4xx moves on at once
-/// and fails after all `host_count` hosts refused.
+/// Busy or broken replies back off.
+/// A 4xx asks an unasked host.
+/// Fails once every host refused.
 pub(crate) async fn retry_with<T, F, Fut, S, SFut>(
     attempts: u32,
     host_count: usize,
@@ -171,26 +185,34 @@ pub(crate) async fn retry_with<T, F, Fut, S, SFut>(
     mut sleep: S,
 ) -> Result<T, Error>
 where
-    F: FnMut(u32) -> Fut,
+    F: FnMut(u32, Vec<usize>) -> Fut,
     Fut: std::future::Future<Output = Result<T, Failure>>,
     S: FnMut(Duration) -> SFut,
     SFut: std::future::Future<Output = ()>,
 {
     let mut last = Error::Network("no available cdn servers".to_string());
+    let mut refused: Vec<usize> = Vec::new();
     let mut refusals = 0;
     for attempt in 0..attempts {
-        match fetch(attempt).await {
+        match fetch(attempt, refused.clone()).await {
             Ok(value) => return Ok(value),
-            Err(Failure { err, retry_after }) if retryable(&err) => {
+            Err(Failure {
+                err, retry_after, ..
+            }) if retryable(&err) => {
                 let delay = retry_delay(&err, attempt, retry_after);
                 last = err;
                 if attempt + 1 < attempts {
                     sleep(delay).await;
                 }
             }
-            Err(Failure { err, .. }) if host_refused(&err) => {
-                refusals += 1;
-                if refusals >= host_count.max(1) {
+            Err(Failure { err, host, .. }) if host_refused(&err) => {
+                match host {
+                    Some(i) if !refused.contains(&i) => refused.push(i),
+                    Some(_) => {}
+                    // Unknown host: count the refusal.
+                    None => refusals += 1,
+                }
+                if refused.len() + refusals >= host_count.max(1) {
                     return Err(err);
                 }
                 last = err;
@@ -274,13 +296,19 @@ impl InnerClient {
 
     /// Next healthy server, round-robin.
     fn pick_server(&self) -> Result<usize, Error> {
+        self.pick_server_excluding(&[])
+    }
+
+    /// Next healthy server not in `refused`.
+    fn pick_server_excluding(&self, refused: &[usize]) -> Result<usize, Error> {
         let strikes: Vec<u32> = self
             .strikes
             .iter()
             .map(|s| s.load(Ordering::Relaxed))
             .collect();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
-        pick_index(&strikes, start).ok_or(Error::Network("no available cdn servers".to_string()))
+        pick_index_excluding(&strikes, start, refused)
+            .ok_or(Error::Network("no available cdn servers".to_string()))
     }
 
     fn record(&self, index: usize, ok: bool) {
@@ -295,15 +323,16 @@ impl InnerClient {
         }
     }
 
-    /// One GET on the next healthy server.
+    /// One GET on a healthy, unrefused server.
     async fn fetch_once(
         &self,
         command: &str,
         args: &str,
         manifest_request_code: Option<u64>,
         max_body: usize,
+        refused: &[usize],
     ) -> Result<bytes::Bytes, Failure> {
-        let index = self.pick_server()?;
+        let index = self.pick_server_excluding(refused)?;
         let result = async {
             let response = self
                 .request_on(index, command, args, manifest_request_code)
@@ -323,7 +352,10 @@ impl InnerClient {
             }
             Err(_) => {}
         }
-        result
+        result.map_err(|failure| Failure {
+            host: Some(index),
+            ..failure
+        })
     }
 
     /// GET with retries across the pool.
@@ -339,7 +371,10 @@ impl InnerClient {
         retry_with(
             attempts,
             self.servers.len(),
-            |_| self.fetch_once(command, args, manifest_request_code, max_body),
+            |_, refused| async move {
+                self.fetch_once(command, args, manifest_request_code, max_body, &refused)
+                    .await
+            },
             tokio::time::sleep,
         )
         .await
@@ -446,14 +481,15 @@ impl InnerClient {
                 "chunk {chunk_id}: {expected_len} bytes exceeds ceiling"
             )));
         }
-        let args = format!("{depot_id}/chunk/{chunk_id}");
+        let args = &format!("{depot_id}/chunk/{chunk_id}");
+        let chunk_id = &chunk_id;
         self.pick_server()?;
         retry_with(
             CHUNK_ATTEMPTS,
             self.servers.len(),
-            |_| async {
+            |_, refused| async move {
                 let bytes = self
-                    .fetch_once("depot", &args, None, MAX_CHUNK_BODY)
+                    .fetch_once("depot", args, None, MAX_CHUNK_BODY, &refused)
                     .await?;
                 // Corrupt transfers count as failures.
                 let mut bytes = bytes.to_vec();
@@ -463,7 +499,7 @@ impl InnerClient {
                     expected_len as usize,
                 )
                 .await?;
-                Ok(check_chunk(&chunk_id, data, expected_sha, expected_len)?)
+                Ok(check_chunk(chunk_id, data, expected_sha, expected_len)?)
             },
             tokio::time::sleep,
         )
@@ -519,6 +555,32 @@ mod tests {
     fn all_benched_takes_least_failing() {
         let strikes = [BENCH_STRIKES + 2, BENCH_STRIKES, BENCH_STRIKES + 1];
         assert_eq!(pick_index(&strikes, 0), Some(1));
+    }
+
+    #[test]
+    fn never_picks_a_refused_host() {
+        for start in 0..6 {
+            let pick = pick_index_excluding(&[0, 0, 0], start, &[1]);
+            assert_ne!(pick, Some(1), "start {start}");
+            assert!(pick.is_some());
+        }
+    }
+
+    #[test]
+    fn refused_beats_strikes() {
+        // Benched but unrefused wins.
+        let strikes = [0, BENCH_STRIKES + 5, 0];
+        assert_eq!(pick_index_excluding(&strikes, 0, &[0, 2]), Some(1));
+        let strikes = [BENCH_STRIKES, BENCH_STRIKES + 1, BENCH_STRIKES + 2];
+        assert_eq!(pick_index_excluding(&strikes, 0, &[0]), Some(1));
+    }
+
+    #[test]
+    fn all_refused_picks_nothing() {
+        for start in 0..4 {
+            assert_eq!(pick_index_excluding(&[0, 0, 0], start, &[0, 1, 2]), None);
+        }
+        assert_eq!(pick_index_excluding(&[], 0, &[]), None);
     }
 
     #[test]
@@ -683,7 +745,7 @@ mod retry_tests {
         let result = retry_with(
             attempts,
             hosts,
-            |_| {
+            |_, _| {
                 *tries.lock().unwrap() += 1;
                 let client = client.clone();
                 let url = url.to_string();
@@ -759,6 +821,91 @@ mod retry_tests {
         assert!(matches!(result, Err(Error::HttpStatus(s)) if s == 404));
         assert_eq!(tries, 3);
         assert!(slept.is_empty());
+    }
+
+    /// Per-host replies, cursor pinned at 0.
+    async fn run_hosts(
+        replies: &[&[u16]],
+        attempts: u32,
+    ) -> (Result<u16, Error>, Vec<usize>, Vec<Duration>) {
+        let served = Mutex::new(vec![0usize; replies.len()]);
+        let asked = Mutex::new(Vec::new());
+        let slept = Mutex::new(Vec::new());
+        let strikes = Mutex::new(vec![0u32; replies.len()]);
+        let result = retry_with(
+            attempts,
+            replies.len(),
+            |_, refused| {
+                let strikes_now = strikes.lock().unwrap().clone();
+                let host = pick_index_excluding(&strikes_now, 0, &refused);
+                let reply = host.map(|i| {
+                    asked.lock().unwrap().push(i);
+                    let mut served = served.lock().unwrap();
+                    let n = served[i];
+                    served[i] += 1;
+                    replies[i][n.min(replies[i].len() - 1)]
+                });
+                if let (Some(i), Some(code)) = (host, reply)
+                    && code != 200
+                {
+                    strikes.lock().unwrap()[i] += 1;
+                }
+                async move {
+                    match reply {
+                        None => Err(Error::Network("none".into()).into()),
+                        Some(200) => Ok(200),
+                        Some(code) => Err(Failure {
+                            err: Error::HttpStatus(reqwest::StatusCode::from_u16(code).unwrap()),
+                            retry_after: None,
+                            host,
+                        }),
+                    }
+                }
+            },
+            |delay| {
+                slept.lock().unwrap().push(delay);
+                async {}
+            },
+        )
+        .await;
+        (
+            result,
+            asked.into_inner().unwrap(),
+            slept.into_inner().unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn each_refusing_host_is_asked_once() {
+        let (result, asked, slept) = run_hosts(&[&[404, 200], &[404, 200], &[200]], 5).await;
+        assert_eq!(result.unwrap(), 200);
+        // Host 0 refused; never asked again.
+        assert_eq!(asked, vec![0, 1, 2]);
+        assert!(slept.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refusing_host_is_not_asked_twice() {
+        let (result, asked, _) = run_hosts(&[&[404, 200], &[200]], 5).await;
+        assert_eq!(result.unwrap(), 200);
+        assert_eq!(asked, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn fails_after_every_distinct_host_refused() {
+        let (result, asked, slept) = run_hosts(&[&[404], &[403], &[404]], 5).await;
+        assert!(matches!(result, Err(Error::HttpStatus(s)) if s == 404));
+        assert_eq!(asked, vec![0, 1, 2]);
+        assert!(slept.is_empty());
+    }
+
+    #[tokio::test]
+    async fn busy_host_stays_eligible() {
+        let (result, asked, slept) = run_hosts(&[&[503, 200], &[200]], 5).await;
+        assert_eq!(result.unwrap(), 200);
+        // 503 is no refusal.
+        assert_eq!(asked, vec![0, 0]);
+        assert_eq!(slept, vec![Duration::from_secs(1)]);
     }
 
     #[test]
