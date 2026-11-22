@@ -289,8 +289,7 @@ impl InnerClient {
         };
         if ok {
             // Recovered hosts earn their way back.
-            let _ =
-                strikes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| s.checked_sub(1));
+            let _ = strikes.try_update(Ordering::Relaxed, Ordering::Relaxed, |s| s.checked_sub(1));
         } else {
             strikes.fetch_add(1, Ordering::Relaxed);
         }
