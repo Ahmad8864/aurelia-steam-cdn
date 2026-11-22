@@ -81,14 +81,124 @@ pub(crate) fn check_chunk(
 
 /// Whether another try may succeed.
 pub(crate) fn retryable(err: &Error) -> bool {
-    matches!(
-        err,
-        Error::Request(_)
-            | Error::HttpStatus(_)
-            | Error::Network(_)
-            | Error::Decompress(_)
-            | Error::Eof(_)
-    )
+    match err {
+        Error::HttpStatus(status) => server_busy(*status) || *status == 408,
+        Error::Request(_) | Error::Network(_) | Error::Decompress(_) | Error::Eof(_) => true,
+        _ => false,
+    }
+}
+
+/// Other 4xx: another host may serve it.
+pub(crate) fn host_refused(err: &Error) -> bool {
+    matches!(err, Error::HttpStatus(s) if s.is_client_error() && !retryable(err))
+}
+
+/// 5xx and 429: wait, then retry.
+fn server_busy(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Longest `Retry-After` honoured.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Delay for busy servers: 1/2/4/8 s.
+pub(crate) fn busy_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.min(3))
+}
+
+/// Delay before the next try.
+pub(crate) fn retry_delay(err: &Error, attempt: u32, retry_after: Option<Duration>) -> Duration {
+    match err {
+        Error::HttpStatus(status) if server_busy(*status) => {
+            busy_backoff(attempt).max(retry_after.unwrap_or_default().min(MAX_RETRY_AFTER))
+        }
+        _ => backoff(attempt),
+    }
+}
+
+/// A failed try, with the server's hint.
+#[derive(Debug)]
+pub(crate) struct Failure {
+    pub err: Error,
+    pub retry_after: Option<Duration>,
+}
+
+impl From<Error> for Failure {
+    fn from(err: Error) -> Self {
+        Self {
+            err,
+            retry_after: None,
+        }
+    }
+}
+
+/// Seconds form of `Retry-After`.
+fn retry_after(response: &Response) -> Option<Duration> {
+    let value = response.headers().get(reqwest::header::RETRY_AFTER)?;
+    value
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+/// Status check, then the paced body.
+pub(crate) async fn response_outcome(
+    response: Response,
+    limiter: Option<&RateLimiter>,
+    max_len: usize,
+) -> Result<bytes::Bytes, Failure> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Failure {
+            retry_after: retry_after(&response),
+            err: Error::HttpStatus(status),
+        });
+    }
+    Ok(read_paced(response, limiter, max_len).await?)
+}
+
+/// Run `fetch` up to `attempts` times.
+///
+/// Busy or broken replies back off; a 4xx moves on at once
+/// and fails after all `host_count` hosts refused.
+pub(crate) async fn retry_with<T, F, Fut, S, SFut>(
+    attempts: u32,
+    host_count: usize,
+    mut fetch: F,
+    mut sleep: S,
+) -> Result<T, Error>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T, Failure>>,
+    S: FnMut(Duration) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    let mut last = Error::Network("no available cdn servers".to_string());
+    let mut refusals = 0;
+    for attempt in 0..attempts {
+        match fetch(attempt).await {
+            Ok(value) => return Ok(value),
+            Err(Failure { err, retry_after }) if retryable(&err) => {
+                let delay = retry_delay(&err, attempt, retry_after);
+                last = err;
+                if attempt + 1 < attempts {
+                    sleep(delay).await;
+                }
+            }
+            Err(Failure { err, .. }) if host_refused(&err) => {
+                refusals += 1;
+                if refusals >= host_count.max(1) {
+                    return Err(err);
+                }
+                last = err;
+            }
+            Err(Failure { err, .. }) => return Err(err),
+        }
+    }
+    Err(last)
 }
 
 fn body_too_large(max_len: usize) -> Error {
@@ -152,11 +262,6 @@ impl InnerClient {
         self.limiter.get().filter(|l| l.is_limited())
     }
 
-    /// Body bytes, paced by the limit.
-    async fn read_body(&self, response: Response, max_len: usize) -> Result<bytes::Bytes, Error> {
-        read_paced(response, self.limiter().map(|l| l.as_ref()), max_len).await
-    }
-
     /// Replace the pool, in preference order.
     pub fn set_servers(&mut self, servers: Vec<CDNServer>) {
         self.strikes = servers.iter().map(|_| AtomicU32::new(0)).collect();
@@ -184,11 +289,41 @@ impl InnerClient {
         };
         if ok {
             // Recovered hosts earn their way back.
-            let _ =
-                strikes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| s.checked_sub(1));
+            let _ = strikes.try_update(Ordering::Relaxed, Ordering::Relaxed, |s| s.checked_sub(1));
         } else {
             strikes.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// One GET on the next healthy server.
+    async fn fetch_once(
+        &self,
+        command: &str,
+        args: &str,
+        manifest_request_code: Option<u64>,
+        max_body: usize,
+    ) -> Result<bytes::Bytes, Failure> {
+        let index = self.pick_server()?;
+        let result = async {
+            let response = self
+                .request_on(index, command, args, manifest_request_code)
+                .await?;
+            response_outcome(response, self.limiter().map(|l| l.as_ref()), max_body).await
+        }
+        .await;
+        match &result {
+            Ok(_) => self.record(index, true),
+            Err(failure) if retryable(&failure.err) || host_refused(&failure.err) => {
+                self.record(index, false);
+                tracing::debug!(
+                    "cdn {}: {command}/{args}: {}",
+                    self.servers[index].host,
+                    failure.err
+                );
+            }
+            Err(_) => {}
+        }
+        result
     }
 
     /// GET with retries across the pool.
@@ -200,41 +335,14 @@ impl InnerClient {
         attempts: u32,
         max_body: usize,
     ) -> Result<bytes::Bytes, Error> {
-        let mut last = Error::Network("no available cdn servers".to_string());
-        for attempt in 0..attempts {
-            let index = self.pick_server()?;
-            let result = async {
-                let response = self
-                    .request_on(index, command, args, manifest_request_code)
-                    .await?;
-                let status = response.status();
-                if !status.is_success() {
-                    return Err(Error::HttpStatus(status));
-                }
-                self.read_body(response, max_body).await
-            }
-            .await;
-            match result {
-                Ok(bytes) => {
-                    self.record(index, true);
-                    return Ok(bytes);
-                }
-                Err(e) if retryable(&e) => {
-                    self.record(index, false);
-                    tracing::debug!(
-                        "cdn {} attempt {}: {command}/{args}: {e}",
-                        self.servers[index].host,
-                        attempt + 1
-                    );
-                    last = e;
-                    if attempt + 1 < attempts {
-                        tokio::time::sleep(backoff(attempt)).await;
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last)
+        self.pick_server()?;
+        retry_with(
+            attempts,
+            self.servers.len(),
+            |_| self.fetch_once(command, args, manifest_request_code, max_body),
+            tokio::time::sleep,
+        )
+        .await
     }
 
     pub async fn get_product_info(
@@ -339,37 +447,27 @@ impl InnerClient {
             )));
         }
         let args = format!("{depot_id}/chunk/{chunk_id}");
-        let mut last = Error::Network("no available cdn servers".to_string());
-        for attempt in 0..CHUNK_ATTEMPTS {
-            let bytes = self
-                .get_with_failover("depot", &args, None, 1, MAX_CHUNK_BODY)
-                .await;
-            // Corrupt transfers count as failures.
-            let result = match bytes {
-                Ok(bytes) => {
-                    let mut bytes = bytes.to_vec();
-                    depot_chunk::decrypt_and_decompress(
-                        &mut bytes[..],
-                        depot_key,
-                        expected_len as usize,
-                    )
-                    .await
-                    .and_then(|data| check_chunk(&chunk_id, data, expected_sha, expected_len))
-                }
-                Err(e) => Err(e),
-            };
-            match result {
-                Ok(data) => return Ok(data),
-                Err(e) if retryable(&e) => {
-                    last = e;
-                    if attempt + 1 < CHUNK_ATTEMPTS {
-                        tokio::time::sleep(backoff(attempt)).await;
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last)
+        self.pick_server()?;
+        retry_with(
+            CHUNK_ATTEMPTS,
+            self.servers.len(),
+            |_| async {
+                let bytes = self
+                    .fetch_once("depot", &args, None, MAX_CHUNK_BODY)
+                    .await?;
+                // Corrupt transfers count as failures.
+                let mut bytes = bytes.to_vec();
+                let data = depot_chunk::decrypt_and_decompress(
+                    &mut bytes[..],
+                    depot_key,
+                    expected_len as usize,
+                )
+                .await?;
+                Ok(check_chunk(&chunk_id, data, expected_sha, expected_len)?)
+            },
+            tokio::time::sleep,
+        )
+        .await
     }
 }
 
@@ -438,6 +536,16 @@ mod tests {
             reqwest::StatusCode::BAD_GATEWAY
         )));
         assert!(retryable(&Error::Decompress("bad zip".into())));
+        assert!(retryable(&Error::HttpStatus(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        )));
+        // Other 4xx: next host, no wait.
+        assert!(!retryable(&Error::HttpStatus(
+            reqwest::StatusCode::NOT_FOUND
+        )));
+        assert!(!retryable(&Error::HttpStatus(
+            reqwest::StatusCode::FORBIDDEN
+        )));
         // Disk errors never retry.
         let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
         assert!(!retryable(&Error::Io(full)));
@@ -532,5 +640,136 @@ mod pacing_tests {
             .await
             .unwrap();
         assert_eq!(body.len(), 40_000);
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Answer each request with the next reply.
+    async fn serve_sequence(replies: Vec<&'static str>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for reply in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    const BUSY: &str =
+        "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    const BUSY_HINT: &str = "HTTP/1.1 503 Service Unavailable\r\nretry-after: 5\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    const MISSING: &str =
+        "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    const OK: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok";
+
+    /// Retry against `url`, recording sleeps.
+    async fn run(
+        url: &str,
+        attempts: u32,
+        hosts: usize,
+    ) -> (Result<bytes::Bytes, Error>, Vec<Duration>, u32) {
+        let client = Client::new();
+        let slept = Mutex::new(Vec::new());
+        let tries = Mutex::new(0u32);
+        let result = retry_with(
+            attempts,
+            hosts,
+            |_| {
+                *tries.lock().unwrap() += 1;
+                let client = client.clone();
+                let url = url.to_string();
+                async move {
+                    let response = client.get(url).send().await.map_err(Error::from)?;
+                    response_outcome(response, None, 1024).await
+                }
+            },
+            |delay| {
+                slept.lock().unwrap().push(delay);
+                async {}
+            },
+        )
+        .await;
+        let tries = *tries.lock().unwrap();
+        (result, slept.into_inner().unwrap(), tries)
+    }
+
+    #[tokio::test]
+    async fn busy_then_ok_succeeds_with_backoff() {
+        let url = serve_sequence(vec![BUSY, BUSY, OK]).await;
+        let (result, slept, tries) = run(&url, 5, 4).await;
+        assert_eq!(&result.unwrap()[..], b"ok");
+        assert_eq!(tries, 3);
+        assert_eq!(slept, vec![Duration::from_secs(1), Duration::from_secs(2)]);
+    }
+
+    #[tokio::test]
+    async fn not_found_on_the_only_host_fails_fast() {
+        let url = serve_sequence(vec![MISSING, OK]).await;
+        let (result, slept, tries) = run(&url, 5, 1).await;
+        assert!(matches!(result, Err(Error::HttpStatus(s)) if s == 404));
+        assert_eq!(tries, 1);
+        assert!(slept.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_the_attempts() {
+        let url = serve_sequence(vec![BUSY, BUSY, BUSY]).await;
+        let (result, slept, tries) = run(&url, 3, 4).await;
+        assert!(matches!(result, Err(Error::HttpStatus(s)) if s == 503));
+        assert_eq!(tries, 3);
+        // No sleep after the last try.
+        assert_eq!(slept.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_honoured_and_capped() {
+        let url = serve_sequence(vec![BUSY_HINT, OK]).await;
+        let (result, slept, _) = run(&url, 5, 4).await;
+        assert!(result.is_ok());
+        assert_eq!(slept, vec![Duration::from_secs(5)]);
+        let busy = Error::HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            retry_delay(&busy, 0, Some(Duration::from_secs(600))),
+            MAX_RETRY_AFTER
+        );
+    }
+
+    #[tokio::test]
+    async fn refusals_move_to_the_next_host_without_waiting() {
+        let url = serve_sequence(vec![MISSING, MISSING, OK]).await;
+        let (result, slept, tries) = run(&url, 5, 3).await;
+        assert_eq!(&result.unwrap()[..], b"ok");
+        assert_eq!(tries, 3);
+        assert!(slept.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fails_once_every_host_refused() {
+        let url = serve_sequence(vec![MISSING, MISSING, MISSING, OK]).await;
+        let (result, slept, tries) = run(&url, 5, 3).await;
+        assert!(matches!(result, Err(Error::HttpStatus(s)) if s == 404));
+        assert_eq!(tries, 3);
+        assert!(slept.is_empty());
+    }
+
+    #[test]
+    fn busy_backoff_doubles_to_eight_seconds() {
+        let secs: Vec<u64> = (0..6).map(|a| busy_backoff(a).as_secs()).collect();
+        assert_eq!(secs, vec![1, 2, 4, 8, 8, 8]);
+    }
+
+    #[test]
+    fn corrupt_transfers_keep_the_short_backoff() {
+        let corrupt = Error::Decompress("bad zip".into());
+        assert_eq!(retry_delay(&corrupt, 0, None), backoff(0));
     }
 }

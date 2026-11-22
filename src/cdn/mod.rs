@@ -42,12 +42,6 @@ pub struct CDNClient {
 }
 
 impl CDNClient {
-    pub fn new(connection: Arc<Connection>) -> Self {
-        Self {
-            inner: Arc::new(InnerClient::new(connection)),
-        }
-    }
-
     pub fn with_servers(connection: Arc<Connection>, servers: Vec<CDNServer>) -> Self {
         let mut inner = InnerClient::new(connection);
         inner.set_servers(servers);

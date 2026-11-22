@@ -1,5 +1,5 @@
 // Modified by Aurelia; see README.
-use futures::{StreamExt, stream::FuturesOrdered};
+use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use itertools::Itertools;
 use sha1::Digest;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,7 +179,6 @@ impl ManifestFile {
         limit: Option<Arc<Semaphore>>,
         on_progress: Option<ProgressFn>,
     ) -> Result<(), Error> {
-        let _ = verify_mode;
         let semaphore = limit.unwrap_or_else(|| Arc::new(Semaphore::new(4)));
 
         let metadata_before = tokio::fs::metadata(target_path).await;
@@ -197,7 +196,7 @@ impl ManifestFile {
             out.set_len(self.size).await.map_err(Error::Io)?;
         }
 
-        let mut tasks = self
+        let tasks = self
             .chunks()
             .iter()
             .sorted_by(|&a, &b| a.offset.cmp(&b.offset))
@@ -214,6 +213,7 @@ impl ManifestFile {
                     target_path: target_path.to_path_buf(),
                     // Only existing files hold chunks.
                     check_disk: file_exists_before,
+                    verify_mode,
                 };
                 AbortOnDrop(tokio::spawn(job.run(
                     semaphore.clone(),
@@ -221,24 +221,11 @@ impl ManifestFile {
                     on_progress.clone(),
                 )))
             })
-            .collect::<FuturesOrdered<_>>();
+            // Unordered: write chunks as they finish.
+            .collect::<FuturesUnordered<_>>();
 
-        while let Some(result) = tasks.next().await {
-            if let Some(signal) = &abort_signal {
-                if signal.load(Ordering::Relaxed) {
-                    break;
-                }
-            }
-            let (offset, data) = result??;
-            // Counted by the task on arrival.
-            if let Some(data) = data {
-                out.seek(tokio::io::SeekFrom::Start(offset))
-                    .await
-                    .map_err(Error::Io)?;
-                out.write_all(&data).await.map_err(Error::Io)?;
-            }
-        }
-        out.flush().await.map_err(Error::Io)?;
+        let results = tasks.map(|joined| joined.map_err(Error::from).and_then(|r| r));
+        write_chunks(&mut out, results, abort_signal.as_deref()).await?;
 
         #[cfg(unix)]
         self.apply_unix_mode(target_path).await?;
@@ -312,6 +299,8 @@ struct ChunkJob {
     size: u32,
     target_path: std::path::PathBuf,
     check_disk: bool,
+    /// Mismatches are only news when verifying.
+    verify_mode: bool,
 }
 
 impl ChunkJob {
@@ -361,30 +350,93 @@ impl ChunkJob {
 
     /// Whether the bytes on disk match.
     async fn on_disk(&self) -> Result<bool, Error> {
-        let Ok(mut file) = tokio::fs::File::open(&self.target_path).await else {
-            return Ok(false);
-        };
-        let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-        // Oversized chunks: refetch, then reject.
-        if self.size as usize > crate::utils::lzma::MAX_CHUNK_LEN {
-            return Ok(false);
+        match disk_chunk(&self.target_path, self.offset, self.size, &self.sha).await? {
+            DiskChunk::Matches => Ok(true),
+            DiskChunk::Missing => Ok(false),
+            DiskChunk::Differs => {
+                if mismatch_is_corruption(self.verify_mode) {
+                    tracing::warn!("Corruption detected in chunk {}", self.id);
+                } else {
+                    tracing::debug!("Chunk {} not on disk yet", self.id);
+                }
+                Ok(false)
+            }
         }
-        if len < self.offset + self.size as u64 {
-            return Ok(false);
-        }
-        file.seek(tokio::io::SeekFrom::Start(self.offset))
-            .await
-            .map_err(Error::Io)?;
-        let mut buffer = vec![0u8; self.size as usize];
-        if file.read_exact(&mut buffer).await.is_err() {
-            return Ok(false);
-        }
-        let matches = sha1::Sha1::digest(&buffer).as_slice() == self.sha.as_slice();
-        if !matches {
-            tracing::warn!("Corruption detected in chunk {}", self.id);
-        }
-        Ok(matches)
     }
+}
+
+/// What the file holds at a chunk's range.
+#[derive(Debug, PartialEq, Eq)]
+enum DiskChunk {
+    /// File too short or unreadable.
+    Missing,
+    Matches,
+    Differs,
+}
+
+/// Fresh or partial writes differ normally.
+fn mismatch_is_corruption(verify_mode: bool) -> bool {
+    verify_mode
+}
+
+async fn disk_chunk(
+    path: &std::path::Path,
+    offset: u64,
+    size: u32,
+    sha: &[u8],
+) -> Result<DiskChunk, Error> {
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return Ok(DiskChunk::Missing);
+    };
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    // Oversized chunks: refetch, then reject.
+    if size as usize > crate::utils::lzma::MAX_CHUNK_LEN {
+        return Ok(DiskChunk::Missing);
+    }
+    if len < offset + size as u64 {
+        return Ok(DiskChunk::Missing);
+    }
+    file.seek(tokio::io::SeekFrom::Start(offset))
+        .await
+        .map_err(Error::Io)?;
+    let mut buffer = vec![0u8; size as usize];
+    if file.read_exact(&mut buffer).await.is_err() {
+        return Ok(DiskChunk::Missing);
+    }
+    Ok(if sha1::Sha1::digest(&buffer).as_slice() == sha {
+        DiskChunk::Matches
+    } else {
+        DiskChunk::Differs
+    })
+}
+
+/// Write `(offset, data)` results in arrival order.
+///
+/// `None` data means the chunk was already on disk.
+async fn write_chunks<W, S>(
+    out: &mut W,
+    results: S,
+    abort_signal: Option<&AtomicBool>,
+) -> Result<(), Error>
+where
+    W: AsyncWriteExt + AsyncSeekExt + Unpin,
+    S: Stream<Item = Result<(u64, Option<Vec<u8>>), Error>>,
+{
+    let mut results = std::pin::pin!(results);
+    while let Some(result) = results.next().await {
+        if abort_signal.is_some_and(|s| s.load(Ordering::Relaxed)) {
+            break;
+        }
+        let (offset, data) = result?;
+        // Counted by the task on arrival.
+        if let Some(data) = data {
+            out.seek(tokio::io::SeekFrom::Start(offset))
+                .await
+                .map_err(Error::Io)?;
+            out.write_all(&data).await.map_err(Error::Io)?;
+        }
+    }
+    out.flush().await.map_err(Error::Io)
 }
 
 #[cfg(test)]
@@ -397,5 +449,87 @@ mod in_memory_tests {
         assert!(check_in_memory_len(MAX_IN_MEMORY_LEN).is_ok());
         assert!(check_in_memory_len(MAX_IN_MEMORY_LEN + 1).is_err());
         assert!(check_in_memory_len(u64::MAX).is_err());
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    fn chunk(offset: u64, byte: u8, len: usize) -> Result<(u64, Option<Vec<u8>>), Error> {
+        Ok((offset, Some(vec![byte; len])))
+    }
+
+    #[tokio::test]
+    async fn out_of_order_chunks_land_at_their_offsets() {
+        let mut out = std::io::Cursor::new(vec![0u8; 12]);
+        let results = futures::stream::iter(vec![
+            chunk(8, b'c', 4),
+            Ok((4, None)), // already on disk
+            chunk(0, b'a', 4),
+        ]);
+        write_chunks(&mut out, results, None).await.unwrap();
+        assert_eq!(out.into_inner(), b"aaaa\0\0\0\0cccc".to_vec());
+    }
+
+    #[tokio::test]
+    async fn abort_stops_before_the_next_write() {
+        let mut out = std::io::Cursor::new(vec![0u8; 4]);
+        let abort = AtomicBool::new(true);
+        let results = futures::stream::iter(vec![chunk(0, b'a', 4)]);
+        write_chunks(&mut out, results, Some(&abort)).await.unwrap();
+        assert_eq!(out.into_inner(), vec![0u8; 4]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_chunk_is_reported() {
+        let mut out = std::io::Cursor::new(vec![0u8; 4]);
+        let results = futures::stream::iter(vec![Err(Error::Unexpected("boom".into()))]);
+        assert!(write_chunks(&mut out, results, None).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod disk_chunk_tests {
+    use super::*;
+
+    fn sha(data: &[u8]) -> Vec<u8> {
+        sha1::Sha1::digest(data).to_vec()
+    }
+
+    #[tokio::test]
+    async fn preallocated_zeros_differ_but_are_not_corruption() {
+        let dir = std::env::temp_dir().join(format!("cdn-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prealloc.bin");
+        std::fs::write(&path, vec![0u8; 8]).unwrap();
+        let got = disk_chunk(&path, 0, 4, &sha(b"real")).await.unwrap();
+        assert_eq!(got, DiskChunk::Differs);
+        assert!(!mismatch_is_corruption(false));
+        assert!(mismatch_is_corruption(true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn matching_and_short_files() {
+        let dir = std::env::temp_dir().join(format!("cdn-disk2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.bin");
+        std::fs::write(&path, b"xxxxreal").unwrap();
+        assert_eq!(
+            disk_chunk(&path, 4, 4, &sha(b"real")).await.unwrap(),
+            DiskChunk::Matches
+        );
+        assert_eq!(
+            disk_chunk(&path, 6, 4, &sha(b"real")).await.unwrap(),
+            DiskChunk::Missing
+        );
+        assert_eq!(
+            disk_chunk(&dir.join("absent"), 0, 4, &sha(b"real"))
+                .await
+                .unwrap(),
+            DiskChunk::Missing
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

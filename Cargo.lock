@@ -86,7 +86,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aurelia-steam-cdn"
-version = "4.1.0"
+version = "5.0.0"
 dependencies = [
  "aes 0.9.4",
  "aurelia-steam-vent",
@@ -98,7 +98,7 @@ dependencies = [
  "futures",
  "itertools",
  "keyvalues-parser",
- "lzma-rs",
+ "lzma-rust2",
  "reqwest",
  "ruzstd",
  "serde",
@@ -1482,13 +1482,11 @@ dependencies = [
 
 [[package]]
 name = "keyvalues-parser"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e4c8354918309196302015ac9cae43362f1a13d0d5c5539a33b4c2fd2cd6d25"
+checksum = "eded51a3b2cdcdc173e23683fd49f72e8151160b279f80c0378f7661a2ae10b7"
 dependencies = [
  "pest",
- "pest_derive",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1530,14 +1528,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
-name = "lzma-rs"
-version = "0.3.0"
+name = "lzma-rust2"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
-dependencies = [
- "byteorder",
- "crc",
-]
+checksum = "ef1d73c59a56771343712b22ea5615092c612c16ba291c0979e3105dfeec4890"
 
 [[package]]
 name = "memchr"
@@ -1682,40 +1676,6 @@ dependencies = [
  "memchr",
  "thiserror 2.0.21",
  "ucd-trie",
-]
-
-[[package]]
-name = "pest_derive"
-version = "2.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "816518421cfc6887a0d62bf441b6ffb4536fcc926395a69e1a85852d4363f57e"
-dependencies = [
- "pest",
- "pest_generator",
-]
-
-[[package]]
-name = "pest_generator"
-version = "2.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d1396fd3a870fc7838768d171b4616d5c91f6cc25e377b673d714567d99377b"
-dependencies = [
- "pest",
- "pest_meta",
- "proc-macro2",
- "quote",
- "syn 2.0.96",
-]
-
-[[package]]
-name = "pest_meta"
-version = "2.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1e58089ea25d717bfd31fb534e4f3afcc2cc569c70de3e239778991ea3b7dea"
-dependencies = [
- "once_cell",
- "pest",
- "sha2 0.10.8",
 ]
 
 [[package]]
@@ -2085,7 +2045,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.10.1",
- "sha2 0.11.1",
+ "sha2",
  "signature",
  "spki",
  "zeroize",
@@ -2416,17 +2376,6 @@ name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
-
-[[package]]
-name = "sha2"
-version = "0.10.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "793db75ad2bcafc3ffa7c68b215fee268f537982cd901d132f89c6343f3a3dc8"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.16",
- "digest 0.10.7",
-]
 
 [[package]]
 name = "sha2"
