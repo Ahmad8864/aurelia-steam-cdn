@@ -88,6 +88,11 @@ pub(crate) fn retryable(err: &Error) -> bool {
     }
 }
 
+/// Other 4xx: another host may serve it.
+pub(crate) fn host_refused(err: &Error) -> bool {
+    matches!(err, Error::HttpStatus(s) if s.is_client_error() && !retryable(err))
+}
+
 /// 5xx and 429: wait, then retry.
 fn server_busy(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -156,8 +161,12 @@ pub(crate) async fn response_outcome(
 }
 
 /// Run `fetch` up to `attempts` times.
+///
+/// Busy or broken replies back off; a 4xx moves on at once
+/// and fails after all `host_count` hosts refused.
 pub(crate) async fn retry_with<T, F, Fut, S, SFut>(
     attempts: u32,
+    host_count: usize,
     mut fetch: F,
     mut sleep: S,
 ) -> Result<T, Error>
@@ -168,6 +177,7 @@ where
     SFut: std::future::Future<Output = ()>,
 {
     let mut last = Error::Network("no available cdn servers".to_string());
+    let mut refusals = 0;
     for attempt in 0..attempts {
         match fetch(attempt).await {
             Ok(value) => return Ok(value),
@@ -177,6 +187,13 @@ where
                 if attempt + 1 < attempts {
                     sleep(delay).await;
                 }
+            }
+            Err(Failure { err, .. }) if host_refused(&err) => {
+                refusals += 1;
+                if refusals >= host_count.max(1) {
+                    return Err(err);
+                }
+                last = err;
             }
             Err(Failure { err, .. }) => return Err(err),
         }
@@ -297,7 +314,7 @@ impl InnerClient {
         .await;
         match &result {
             Ok(_) => self.record(index, true),
-            Err(failure) if retryable(&failure.err) => {
+            Err(failure) if retryable(&failure.err) || host_refused(&failure.err) => {
                 self.record(index, false);
                 tracing::debug!(
                     "cdn {}: {command}/{args}: {}",
@@ -322,6 +339,7 @@ impl InnerClient {
         self.pick_server()?;
         retry_with(
             attempts,
+            self.servers.len(),
             |_| self.fetch_once(command, args, manifest_request_code, max_body),
             tokio::time::sleep,
         )
@@ -433,6 +451,7 @@ impl InnerClient {
         self.pick_server()?;
         retry_with(
             CHUNK_ATTEMPTS,
+            self.servers.len(),
             |_| async {
                 let bytes = self
                     .fetch_once("depot", &args, None, MAX_CHUNK_BODY)
@@ -521,7 +540,7 @@ mod tests {
         assert!(retryable(&Error::HttpStatus(
             reqwest::StatusCode::TOO_MANY_REQUESTS
         )));
-        // Other 4xx won't fix themselves.
+        // Other 4xx: next host, no wait.
         assert!(!retryable(&Error::HttpStatus(
             reqwest::StatusCode::NOT_FOUND
         )));
@@ -654,12 +673,17 @@ mod retry_tests {
     const OK: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok";
 
     /// Retry against `url`, recording sleeps.
-    async fn run(url: &str, attempts: u32) -> (Result<bytes::Bytes, Error>, Vec<Duration>, u32) {
+    async fn run(
+        url: &str,
+        attempts: u32,
+        hosts: usize,
+    ) -> (Result<bytes::Bytes, Error>, Vec<Duration>, u32) {
         let client = Client::new();
         let slept = Mutex::new(Vec::new());
         let tries = Mutex::new(0u32);
         let result = retry_with(
             attempts,
+            hosts,
             |_| {
                 *tries.lock().unwrap() += 1;
                 let client = client.clone();
@@ -682,16 +706,16 @@ mod retry_tests {
     #[tokio::test]
     async fn busy_then_ok_succeeds_with_backoff() {
         let url = serve_sequence(vec![BUSY, BUSY, OK]).await;
-        let (result, slept, tries) = run(&url, 5).await;
+        let (result, slept, tries) = run(&url, 5, 4).await;
         assert_eq!(&result.unwrap()[..], b"ok");
         assert_eq!(tries, 3);
         assert_eq!(slept, vec![Duration::from_secs(1), Duration::from_secs(2)]);
     }
 
     #[tokio::test]
-    async fn not_found_fails_fast() {
+    async fn not_found_on_the_only_host_fails_fast() {
         let url = serve_sequence(vec![MISSING, OK]).await;
-        let (result, slept, tries) = run(&url, 5).await;
+        let (result, slept, tries) = run(&url, 5, 1).await;
         assert!(matches!(result, Err(Error::HttpStatus(s)) if s == 404));
         assert_eq!(tries, 1);
         assert!(slept.is_empty());
@@ -700,7 +724,7 @@ mod retry_tests {
     #[tokio::test]
     async fn gives_up_after_the_attempts() {
         let url = serve_sequence(vec![BUSY, BUSY, BUSY]).await;
-        let (result, slept, tries) = run(&url, 3).await;
+        let (result, slept, tries) = run(&url, 3, 4).await;
         assert!(matches!(result, Err(Error::HttpStatus(s)) if s == 503));
         assert_eq!(tries, 3);
         // No sleep after the last try.
@@ -710,7 +734,7 @@ mod retry_tests {
     #[tokio::test]
     async fn retry_after_is_honoured_and_capped() {
         let url = serve_sequence(vec![BUSY_HINT, OK]).await;
-        let (result, slept, _) = run(&url, 5).await;
+        let (result, slept, _) = run(&url, 5, 4).await;
         assert!(result.is_ok());
         assert_eq!(slept, vec![Duration::from_secs(5)]);
         let busy = Error::HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE);
@@ -718,6 +742,24 @@ mod retry_tests {
             retry_delay(&busy, 0, Some(Duration::from_secs(600))),
             MAX_RETRY_AFTER
         );
+    }
+
+    #[tokio::test]
+    async fn refusals_move_to_the_next_host_without_waiting() {
+        let url = serve_sequence(vec![MISSING, MISSING, OK]).await;
+        let (result, slept, tries) = run(&url, 5, 3).await;
+        assert_eq!(&result.unwrap()[..], b"ok");
+        assert_eq!(tries, 3);
+        assert!(slept.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fails_once_every_host_refused() {
+        let url = serve_sequence(vec![MISSING, MISSING, MISSING, OK]).await;
+        let (result, slept, tries) = run(&url, 5, 3).await;
+        assert!(matches!(result, Err(Error::HttpStatus(s)) if s == 404));
+        assert_eq!(tries, 3);
+        assert!(slept.is_empty());
     }
 
     #[test]
