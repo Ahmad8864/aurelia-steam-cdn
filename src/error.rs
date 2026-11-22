@@ -1,5 +1,5 @@
 // Modified by Aurelia; see README.
-use aes::cipher::block_padding::UnpadError;
+use aes::cipher::block_padding::Error as UnpadError;
 use lzma_rs::error::Error as LzmaError;
 use reqwest::StatusCode;
 use steam_vent::NetworkError;
