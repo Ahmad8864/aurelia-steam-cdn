@@ -179,7 +179,6 @@ impl ManifestFile {
         limit: Option<Arc<Semaphore>>,
         on_progress: Option<ProgressFn>,
     ) -> Result<(), Error> {
-        let _ = verify_mode;
         let semaphore = limit.unwrap_or_else(|| Arc::new(Semaphore::new(4)));
 
         let metadata_before = tokio::fs::metadata(target_path).await;
@@ -214,6 +213,7 @@ impl ManifestFile {
                     target_path: target_path.to_path_buf(),
                     // Only existing files hold chunks.
                     check_disk: file_exists_before,
+                    verify_mode,
                 };
                 AbortOnDrop(tokio::spawn(job.run(
                     semaphore.clone(),
@@ -299,6 +299,8 @@ struct ChunkJob {
     size: u32,
     target_path: std::path::PathBuf,
     check_disk: bool,
+    /// Mismatches are only news when verifying.
+    verify_mode: bool,
 }
 
 impl ChunkJob {
@@ -348,30 +350,64 @@ impl ChunkJob {
 
     /// Whether the bytes on disk match.
     async fn on_disk(&self) -> Result<bool, Error> {
-        let Ok(mut file) = tokio::fs::File::open(&self.target_path).await else {
-            return Ok(false);
-        };
-        let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-        // Oversized chunks: refetch, then reject.
-        if self.size as usize > crate::utils::lzma::MAX_CHUNK_LEN {
-            return Ok(false);
+        match disk_chunk(&self.target_path, self.offset, self.size, &self.sha).await? {
+            DiskChunk::Matches => Ok(true),
+            DiskChunk::Missing => Ok(false),
+            DiskChunk::Differs => {
+                if mismatch_is_corruption(self.verify_mode) {
+                    tracing::warn!("Corruption detected in chunk {}", self.id);
+                } else {
+                    tracing::debug!("Chunk {} not on disk yet", self.id);
+                }
+                Ok(false)
+            }
         }
-        if len < self.offset + self.size as u64 {
-            return Ok(false);
-        }
-        file.seek(tokio::io::SeekFrom::Start(self.offset))
-            .await
-            .map_err(Error::Io)?;
-        let mut buffer = vec![0u8; self.size as usize];
-        if file.read_exact(&mut buffer).await.is_err() {
-            return Ok(false);
-        }
-        let matches = sha1::Sha1::digest(&buffer).as_slice() == self.sha.as_slice();
-        if !matches {
-            tracing::warn!("Corruption detected in chunk {}", self.id);
-        }
-        Ok(matches)
     }
+}
+
+/// What the file holds at a chunk's range.
+#[derive(Debug, PartialEq, Eq)]
+enum DiskChunk {
+    /// File too short or unreadable.
+    Missing,
+    Matches,
+    Differs,
+}
+
+/// Fresh or partial writes differ normally.
+fn mismatch_is_corruption(verify_mode: bool) -> bool {
+    verify_mode
+}
+
+async fn disk_chunk(
+    path: &std::path::Path,
+    offset: u64,
+    size: u32,
+    sha: &[u8],
+) -> Result<DiskChunk, Error> {
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return Ok(DiskChunk::Missing);
+    };
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    // Oversized chunks: refetch, then reject.
+    if size as usize > crate::utils::lzma::MAX_CHUNK_LEN {
+        return Ok(DiskChunk::Missing);
+    }
+    if len < offset + size as u64 {
+        return Ok(DiskChunk::Missing);
+    }
+    file.seek(tokio::io::SeekFrom::Start(offset))
+        .await
+        .map_err(Error::Io)?;
+    let mut buffer = vec![0u8; size as usize];
+    if file.read_exact(&mut buffer).await.is_err() {
+        return Ok(DiskChunk::Missing);
+    }
+    Ok(if sha1::Sha1::digest(&buffer).as_slice() == sha {
+        DiskChunk::Matches
+    } else {
+        DiskChunk::Differs
+    })
 }
 
 /// Write `(offset, data)` results in arrival order.
@@ -450,5 +486,50 @@ mod write_tests {
         let mut out = std::io::Cursor::new(vec![0u8; 4]);
         let results = futures::stream::iter(vec![Err(Error::Unexpected("boom".into()))]);
         assert!(write_chunks(&mut out, results, None).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod disk_chunk_tests {
+    use super::*;
+
+    fn sha(data: &[u8]) -> Vec<u8> {
+        sha1::Sha1::digest(data).to_vec()
+    }
+
+    #[tokio::test]
+    async fn preallocated_zeros_differ_but_are_not_corruption() {
+        let dir = std::env::temp_dir().join(format!("cdn-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prealloc.bin");
+        std::fs::write(&path, vec![0u8; 8]).unwrap();
+        let got = disk_chunk(&path, 0, 4, &sha(b"real")).await.unwrap();
+        assert_eq!(got, DiskChunk::Differs);
+        assert!(!mismatch_is_corruption(false));
+        assert!(mismatch_is_corruption(true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn matching_and_short_files() {
+        let dir = std::env::temp_dir().join(format!("cdn-disk2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.bin");
+        std::fs::write(&path, b"xxxxreal").unwrap();
+        assert_eq!(
+            disk_chunk(&path, 4, 4, &sha(b"real")).await.unwrap(),
+            DiskChunk::Matches
+        );
+        assert_eq!(
+            disk_chunk(&path, 6, 4, &sha(b"real")).await.unwrap(),
+            DiskChunk::Missing
+        );
+        assert_eq!(
+            disk_chunk(&dir.join("absent"), 0, 4, &sha(b"real"))
+                .await
+                .unwrap(),
+            DiskChunk::Missing
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
