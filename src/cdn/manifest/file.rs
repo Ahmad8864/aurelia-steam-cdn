@@ -1,5 +1,5 @@
 // Modified by Aurelia; see README.
-use futures::{StreamExt, stream::FuturesOrdered};
+use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use itertools::Itertools;
 use sha1::Digest;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -197,7 +197,7 @@ impl ManifestFile {
             out.set_len(self.size).await.map_err(Error::Io)?;
         }
 
-        let mut tasks = self
+        let tasks = self
             .chunks()
             .iter()
             .sorted_by(|&a, &b| a.offset.cmp(&b.offset))
@@ -221,24 +221,11 @@ impl ManifestFile {
                     on_progress.clone(),
                 )))
             })
-            .collect::<FuturesOrdered<_>>();
+            // Unordered: write chunks as they finish.
+            .collect::<FuturesUnordered<_>>();
 
-        while let Some(result) = tasks.next().await {
-            if let Some(signal) = &abort_signal {
-                if signal.load(Ordering::Relaxed) {
-                    break;
-                }
-            }
-            let (offset, data) = result??;
-            // Counted by the task on arrival.
-            if let Some(data) = data {
-                out.seek(tokio::io::SeekFrom::Start(offset))
-                    .await
-                    .map_err(Error::Io)?;
-                out.write_all(&data).await.map_err(Error::Io)?;
-            }
-        }
-        out.flush().await.map_err(Error::Io)?;
+        let results = tasks.map(|joined| joined.map_err(Error::from).and_then(|r| r));
+        write_chunks(&mut out, results, abort_signal.as_deref()).await?;
 
         #[cfg(unix)]
         self.apply_unix_mode(target_path).await?;
@@ -387,6 +374,35 @@ impl ChunkJob {
     }
 }
 
+/// Write `(offset, data)` results in arrival order.
+///
+/// `None` data means the chunk was already on disk.
+async fn write_chunks<W, S>(
+    out: &mut W,
+    results: S,
+    abort_signal: Option<&AtomicBool>,
+) -> Result<(), Error>
+where
+    W: AsyncWriteExt + AsyncSeekExt + Unpin,
+    S: Stream<Item = Result<(u64, Option<Vec<u8>>), Error>>,
+{
+    let mut results = std::pin::pin!(results);
+    while let Some(result) = results.next().await {
+        if abort_signal.is_some_and(|s| s.load(Ordering::Relaxed)) {
+            break;
+        }
+        let (offset, data) = result?;
+        // Counted by the task on arrival.
+        if let Some(data) = data {
+            out.seek(tokio::io::SeekFrom::Start(offset))
+                .await
+                .map_err(Error::Io)?;
+            out.write_all(&data).await.map_err(Error::Io)?;
+        }
+    }
+    out.flush().await.map_err(Error::Io)
+}
+
 #[cfg(test)]
 mod in_memory_tests {
     use super::*;
@@ -397,5 +413,42 @@ mod in_memory_tests {
         assert!(check_in_memory_len(MAX_IN_MEMORY_LEN).is_ok());
         assert!(check_in_memory_len(MAX_IN_MEMORY_LEN + 1).is_err());
         assert!(check_in_memory_len(u64::MAX).is_err());
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    fn chunk(offset: u64, byte: u8, len: usize) -> Result<(u64, Option<Vec<u8>>), Error> {
+        Ok((offset, Some(vec![byte; len])))
+    }
+
+    #[tokio::test]
+    async fn out_of_order_chunks_land_at_their_offsets() {
+        let mut out = std::io::Cursor::new(vec![0u8; 12]);
+        let results = futures::stream::iter(vec![
+            chunk(8, b'c', 4),
+            Ok((4, None)), // already on disk
+            chunk(0, b'a', 4),
+        ]);
+        write_chunks(&mut out, results, None).await.unwrap();
+        assert_eq!(out.into_inner(), b"aaaa\0\0\0\0cccc".to_vec());
+    }
+
+    #[tokio::test]
+    async fn abort_stops_before_the_next_write() {
+        let mut out = std::io::Cursor::new(vec![0u8; 4]);
+        let abort = AtomicBool::new(true);
+        let results = futures::stream::iter(vec![chunk(0, b'a', 4)]);
+        write_chunks(&mut out, results, Some(&abort)).await.unwrap();
+        assert_eq!(out.into_inner(), vec![0u8; 4]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_chunk_is_reported() {
+        let mut out = std::io::Cursor::new(vec![0u8; 4]);
+        let results = futures::stream::iter(vec![Err(Error::Unexpected("boom".into()))]);
+        assert!(write_chunks(&mut out, results, None).await.is_err());
     }
 }
