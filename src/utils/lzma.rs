@@ -70,7 +70,7 @@ pub fn decompress_vsz(data: &[u8], max_len: usize) -> Result<Vec<u8>, Error> {
     // self-delimiting and carries its own content size, so ruzstd stops at the end of
     // the frame; the trailing footer bytes are simply not consumed.
     let frame = &data[VSZ_HEADER_LENGTH..data.len() - VSZ_FOOTER_LENGTH];
-    let mut decoder = ruzstd::StreamingDecoder::new(std::io::Cursor::new(frame))
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(std::io::Cursor::new(frame))
         .map_err(|e| Error::Decompress(format!("zstd frame: {e}")))?;
     read_bounded(&mut decoder, max_len)
 }
@@ -183,6 +183,34 @@ mod tests {
         data.extend_from_slice(&0x767Au16.to_le_bytes());
         assert!(matches!(
             decompress(&data, 1024).await,
+            Err(Error::Decompress(_))
+        ));
+    }
+
+    /// VSZ container around `payload`.
+    fn vsz_wrapping(payload: &[u8]) -> Vec<u8> {
+        let frame =
+            ruzstd::encoding::compress_to_vec(payload, ruzstd::encoding::CompressionLevel::Fastest);
+        let mut data = b"VSZa".to_vec();
+        data.extend_from_slice(&[0u8; 4]);
+        data.extend_from_slice(&frame);
+        data.extend_from_slice(&[0u8; 8]);
+        data.extend_from_slice(b"zsv");
+        data
+    }
+
+    #[test]
+    fn vsz_round_trips() {
+        let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let data = vsz_wrapping(&payload);
+        assert_eq!(decompress_vsz(&data, payload.len()).unwrap(), payload);
+    }
+
+    #[test]
+    fn vsz_over_limit_is_rejected() {
+        let data = vsz_wrapping(&[0u8; 4096]);
+        assert!(matches!(
+            decompress_vsz(&data, 1024),
             Err(Error::Decompress(_))
         ));
     }
