@@ -1,5 +1,5 @@
 // Modified by Aurelia; see README.
-use lzma_rs::decompress::raw::{LzmaDecoder, LzmaParams, LzmaProperties};
+use lzma_rust2::LzmaReader;
 use std::io::{Cursor, SeekFrom};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
@@ -112,30 +112,24 @@ pub async fn decompress(data: &[u8], max_len: usize) -> Result<Vec<u8>, Error> {
     }
 
     let decompressed_data = task::spawn_blocking(move || -> Result<Vec<u8>, Error> {
-        let mut decompressed = Vec::with_capacity(decompressed_size as usize);
-
-        let lc = (properties[0] % 9) as u32;
-        let remainder = (properties[0] / 9) as u32;
-        let lp = remainder % 5;
-        let pb = remainder / 5;
-
-        let mut dict_size = 0u32;
-
-        for i in 0..4 {
-            dict_size += (properties[1 + i] as u32) << (i * 8);
-        }
-
-        LzmaDecoder::new(
-            LzmaParams::new(
-                LzmaProperties { lc, lp, pb },
-                dict_size,
-                Some(decompressed_size as u64),
-            ),
+        let dict_size =
+            u32::from_le_bytes([properties[1], properties[2], properties[3], properties[4]]);
+        // Stops at the declared size.
+        let reader = LzmaReader::new_with_props(
+            &buffer[..],
+            decompressed_size as u64,
+            properties[0],
+            dict_size,
             None,
-        )?
-        .decompress(&mut Cursor::new(buffer), &mut decompressed)?;
-
-        Ok(decompressed)
+        )
+        .map_err(|e| Error::Decompress(format!("LZMA header: {e}")))?;
+        let mut out = Vec::with_capacity(decompressed_size as usize);
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(reader, max_len as u64 + 1),
+            &mut out,
+        )
+        .map_err(|e| Error::Decompress(format!("LZMA stream: {e}")))?;
+        Ok(out)
     })
     .await??;
 
@@ -211,6 +205,78 @@ mod tests {
         let data = vsz_wrapping(&[0u8; 4096]);
         assert!(matches!(
             decompress_vsz(&data, 1024),
+            Err(Error::Decompress(_))
+        ));
+    }
+
+    /// A VZ container around `plain`.
+    fn vz(plain: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let options = lzma_rust2::LzmaOptions::with_preset(6);
+        let mut writer = lzma_rust2::LzmaWriter::new(
+            Vec::new(),
+            &options,
+            false,
+            false,
+            Some(plain.len() as u64),
+        )
+        .unwrap();
+        writer.write_all(plain).unwrap();
+        let stream = writer.finish().unwrap();
+        let mut out = b"VZa".to_vec();
+        out.extend_from_slice(&[0u8; 4]);
+        out.push(options.get_props());
+        out.extend_from_slice(&options.dict_size.to_le_bytes());
+        out.extend_from_slice(&stream);
+        out.extend_from_slice(&crc32fast::hash(plain).to_le_bytes());
+        out.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"zv");
+        out
+    }
+
+    #[tokio::test]
+    async fn vz_round_trips() {
+        let plain = b"chunk content ".repeat(100);
+        assert_eq!(decompress(&vz(&plain), plain.len()).await.unwrap(), plain);
+        let noise: Vec<u8> = (0..5000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        assert_eq!(decompress(&vz(&noise), noise.len()).await.unwrap(), noise);
+    }
+
+    #[tokio::test]
+    async fn vz_rejects_bad_crc_size_and_stream() {
+        let plain = b"chunk content ".repeat(100);
+        let good = vz(&plain);
+        let n = good.len();
+
+        let mut bad_crc = good.clone();
+        bad_crc[n - 10] ^= 1;
+        assert!(matches!(
+            decompress(&bad_crc, plain.len()).await,
+            Err(Error::Decompress(_))
+        ));
+
+        // Over the limit: refused before decoding.
+        assert!(matches!(
+            decompress(&good, plain.len() - 1).await,
+            Err(Error::Decompress(_))
+        ));
+
+        // Claims more than the stream holds.
+        let mut long = good.clone();
+        long[n - 6..n - 2].copy_from_slice(&(plain.len() as u32 + 1).to_le_bytes());
+        assert!(matches!(
+            decompress(&long, plain.len() + 1).await,
+            Err(Error::Decompress(_))
+        ));
+
+        let mut garbled = good;
+        for b in &mut garbled[12..n - 10] {
+            *b = 0xff;
+        }
+        assert!(matches!(
+            decompress(&garbled, plain.len()).await,
             Err(Error::Decompress(_))
         ));
     }

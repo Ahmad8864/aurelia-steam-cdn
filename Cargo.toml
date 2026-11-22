@@ -25,5 +25,9 @@ base64 = "0.23"
 aes = "0.9"
 cbc = "0.2"
 sha1 = "0.11"
-lzma-rs = { version = "0.3", features = ["raw_decoder"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "optimization"] } # Decodes Steam's VZ chunk containers.
 ruzstd = "0.9.1" # Decodes Steam's VSZ chunk containers.
+
+[dev-dependencies]
+# Builds VZ payloads for round-trip tests.
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder"] }

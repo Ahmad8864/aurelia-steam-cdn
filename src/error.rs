@@ -1,6 +1,5 @@
 // Modified by Aurelia; see README.
 use aes::cipher::block_padding::Error as UnpadError;
-use lzma_rs::error::Error as LzmaError;
 use reqwest::StatusCode;
 use steam_vent::NetworkError;
 use tokio::{sync::AcquireError, task::JoinError};
@@ -40,12 +39,6 @@ impl From<JoinError> for Error {
 
 impl From<ZipError> for Error {
     fn from(err: ZipError) -> Self {
-        Self::Decompress(err.to_string())
-    }
-}
-
-impl From<LzmaError> for Error {
-    fn from(err: LzmaError) -> Self {
         Self::Decompress(err.to_string())
     }
 }
