@@ -24,7 +24,7 @@ pub const FLAG_SYMLINK: u32 = 512;
 
 /// First bytes of executables a depot may ship without `FLAG_EXECUTABLE`.
 #[cfg(unix)]
-const EXECUTABLE_MAGIC: [&[u8]; 6] = [
+const EXECUTABLE_MAGIC: &[&[u8]] = &[
     b"\x7fELF",
     b"#!",
     b"\xcf\xfa\xed\xfe", // Mach-O, 64-bit
